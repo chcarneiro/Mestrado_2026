@@ -14,15 +14,22 @@ constexpr float IIS3DWB_SENS_MG_LSB = 0.122f; // de 0.122f para ~0,061 mg/LSB co
 
 // Parâmetros do filtro IIR e histerese
 constexpr float ALPHA = 0.3f;       // 0 < ALPHA <= 1, menor = mais suave, alterando o formato do sinal apenas.
+constexpr float BETA = 0.05f;
 
 // Criando uma histerese:
-constexpr float TH_ON_MG  = 500.0f; // ativa evento acima desse nível de vibração 300 > 500
-constexpr float TH_OFF_MG = 200.0f; // desativa quando cair abaixo disso          sem alterar
+constexpr float TH_ON_MG  = 80.0f;
+constexpr float TH_OFF_MG = 30.0f;
 
 // Estado global do filtro e histerese
 static float fx_mg = 0.0f;
 static float fy_mg = 0.0f;
 static float fz_mg = 0.0f;
+
+// Estimativa lenta da gravidade/DC
+static float gx = 0.0f;
+static float gy = 0.0f;
+static float gz = 0.0f;
+
 static bool evento_ativo = false;
 
 // -----------------------------------------------------------------------------
@@ -80,89 +87,106 @@ void setup()
 // -----------------------------------------------------------------------------
 // loop()
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// loop()
+// -----------------------------------------------------------------------------
 void loop()
 {
-  // 1) Ler 6 registradores consecutivos a partir de OUTX_L_A (0x28)
-  uint8_t r28 = sensor.readRegister(REG_OUTX_L_XL);     // OUTX_L_A (LSB X)
-  uint8_t r29 = sensor.readRegister(REG_OUTX_L_XL + 1); // OUTX_H_A (MSB X)
-  uint8_t r2A = sensor.readRegister(REG_OUTX_L_XL + 2); // OUTY_L_A (LSB Y)
-  uint8_t r2B = sensor.readRegister(REG_OUTX_L_XL + 3); // OUTY_H_A (MSB Y)
-  uint8_t r2C = sensor.readRegister(REG_OUTX_L_XL + 4); // OUTZ_L_A (LSB Z)
-  uint8_t r2D = sensor.readRegister(REG_OUTX_L_XL + 5); // OUTZ_H_A (MSB Z)
+    // -------------------------------------------------------------------------
+    // 1) Leitura raw
+    // -------------------------------------------------------------------------
 
-  // 2) Reconstruir int16_t (little-endian: MSB << 8 | LSB) [web:185][web:188]
-  int16_t x_raw = (int16_t)((int16_t)r29 << 8 | r28);
-  int16_t y_raw = (int16_t)((int16_t)r2B << 8 | r2A);
-  int16_t z_raw = (int16_t)((int16_t)r2D << 8 | r2C);
+    uint8_t r28 = sensor.readRegister(REG_OUTX_L_XL);
+    uint8_t r29 = sensor.readRegister(REG_OUTX_L_XL + 1);
 
-  // 3) Converter para mg usando FS = ±2 g
-  float x_mg = x_raw * IIS3DWB_SENS_MG_LSB;
-  float y_mg = y_raw * IIS3DWB_SENS_MG_LSB;
-  float z_mg = z_raw * IIS3DWB_SENS_MG_LSB;
+    uint8_t r2A = sensor.readRegister(REG_OUTX_L_XL + 2);
+    uint8_t r2B = sensor.readRegister(REG_OUTX_L_XL + 3);
 
-  // 4) Filtro IIR simples em cada eixo
-  fx_mg = (1.0f - ALPHA) * fx_mg + ALPHA * x_mg;
-  fy_mg = (1.0f - ALPHA) * fy_mg + ALPHA * y_mg;
-  fz_mg = (1.0f - ALPHA) * fz_mg + ALPHA * z_mg;
+    uint8_t r2C = sensor.readRegister(REG_OUTX_L_XL + 4);
+    uint8_t r2D = sensor.readRegister(REG_OUTX_L_XL + 5);
 
-  // 5) Magnitude filtrada (aprox. RMS instantâneo)
-  float mag_mg = sqrtf(fx_mg * fx_mg + fy_mg * fy_mg + fz_mg * fz_mg);
+    int16_t x_raw = (int16_t)((int16_t)r29 << 8 | r28);
+    int16_t y_raw = (int16_t)((int16_t)r2B << 8 | r2A);
+    int16_t z_raw = (int16_t)((int16_t)r2D << 8 | r2C);
 
-  // 6) Limiar + histerese para tornar o sistema menos sensível e plotável pelo Teleplot
-  if (!evento_ativo && mag_mg > TH_ON_MG)
-  {
-    evento_ativo = true;
-    Serial.print("EVT_ON,");
-    Serial.print(millis());
-    Serial.print(",");
-    Serial.println(mag_mg, 1);
-  }
+    // -------------------------------------------------------------------------
+    // 2) Converter para mg
+    // -------------------------------------------------------------------------
 
-  if (evento_ativo && mag_mg < TH_OFF_MG)
-  {
-    evento_ativo = false;
-    Serial.print("EVT_OFF,");
-    Serial.print(millis());
-    Serial.print(",");
-    Serial.println(mag_mg, 1);
-  }
+    float x_mg = x_raw * IIS3DWB_SENS_MG_LSB;
+    float y_mg = y_raw * IIS3DWB_SENS_MG_LSB;
+    float z_mg = z_raw * IIS3DWB_SENS_MG_LSB;
 
-  // 6.b) Envio para Teleplot (curvas em tempo real)
+    // -------------------------------------------------------------------------
+    // 3) Estima gravidade lenta
+    // -------------------------------------------------------------------------
 
-  // Valores filtrados em mg
-  Serial.print(">mag:");
-  Serial.println(mag_mg);   // curva 'mag'
+    gx = (1.0f - BETA) * gx + BETA * x_mg;
+    gy = (1.0f - BETA) * gy + BETA * y_mg;
+    gz = (1.0f - BETA) * gz + BETA * z_mg;
 
-  Serial.print(">fx:");
-  Serial.println(fx_mg);    // curva 'fx'
-  // Serial.print(">fy:"); Serial.println(fy_mg);
-  // Serial.print(">fz:"); Serial.println(fz_mg);
+    // -------------------------------------------------------------------------
+    // 4) Remove gravidade
+    // -------------------------------------------------------------------------
 
-  // Valores raw dos 3 eixos (contagens do ADC)
-  Serial.print(">x_raw:");
-  Serial.println(x_raw);    // curva 'x_raw'
+    float vib_x = x_mg - gx;
+    float vib_y = y_mg - gy;
+    float vib_z = z_mg - gz;
 
-  Serial.print(">y_raw:");
-  Serial.println(y_raw);    // curva 'y_raw'
+    // -------------------------------------------------------------------------
+    // 5) EMA da vibração
+    // -------------------------------------------------------------------------
 
-  Serial.print(">z_raw:");
-  Serial.println(z_raw);    // curva 'z_raw'
+    fx_mg = (1.0f - ALPHA) * fx_mg + ALPHA * vib_x;
+    fy_mg = (1.0f - ALPHA) * fy_mg + ALPHA * vib_y;
+    fz_mg = (1.0f - ALPHA) * fz_mg + ALPHA * vib_z;
 
-  // 6.c) Log contínuo em formato CSV para análise offline
-  // t_ms,x_mg_f,y_mg_f,z_mg_f,mag_mg,evt
-  Serial.print(millis());
-  Serial.print(",");
-  Serial.print(fx_mg, 1);
-  Serial.print(",");
-  Serial.print(fy_mg, 1);
-  Serial.print(",");
-  Serial.print(fz_mg, 1);
-  Serial.print(",");
-  Serial.print(mag_mg, 1);
-  Serial.print(",");
-  Serial.println(evento_ativo ? 1 : 0);
+    // -------------------------------------------------------------------------
+    // 6) Magnitude REAL da vibração
+    // -------------------------------------------------------------------------
 
-  // Ajuste de taxa de atualização visual
-  delay(120);
+    float mag_mg = sqrtf(
+        fx_mg * fx_mg +
+        fy_mg * fy_mg +
+        fz_mg * fz_mg
+    );
+
+    // -------------------------------------------------------------------------
+    // 7) Histerese
+    // -------------------------------------------------------------------------
+
+    if (!evento_ativo && mag_mg > TH_ON_MG)
+    {
+        evento_ativo = true;
+    }
+
+    if (evento_ativo && mag_mg < TH_OFF_MG)
+    {
+        evento_ativo = false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 8) TELEPLOT
+    // -------------------------------------------------------------------------
+
+    Serial.print(">mag:");
+    Serial.println(mag_mg);
+
+    Serial.print(">fx:");
+    Serial.println(fx_mg);
+
+    Serial.print(">vx:");
+    Serial.println(vib_x);
+
+    Serial.print(">gx:");
+    Serial.println(gx);
+
+    Serial.print(">x_raw:");
+    Serial.println(x_raw);
+
+    // -------------------------------------------------------------------------
+    // 9) Delay
+    // -------------------------------------------------------------------------
+
+    delay(10);
 }
-
